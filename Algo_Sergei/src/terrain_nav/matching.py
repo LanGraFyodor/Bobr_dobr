@@ -28,27 +28,41 @@ def compute_error_grid(
     x = start_x_m + distances * np.sin(azimuths_rad)
     y = start_y_m + distances * np.cos(azimuths_rad)
 
-    from terrain_nav.sampling import utm_to_source_xy
-    from rasterio.transform import rowcol
-    from terrain_nav.numba_matching import _compute_errors_numba
-
-    x_source, y_source = utm_to_source_xy(source_crs, utm_crs, x.ravel(), y.ravel())
-    rows, cols = rowcol(dataset.transform, x_source, y_source, op=np.float64)
-    rows = np.asarray(rows, dtype=np.float64)
-    cols = np.asarray(cols, dtype=np.float64)
-    
-    nodata = dataset.nodata if dataset.nodata is not None else np.nan
-
-    errors = _compute_errors_numba(
+    predicted = sample_dem_heights(
         dem=dem,
-        nodata=float(nodata),
-        measured_profile_m=measured_profile_m,
-        rows=rows,
-        cols=cols,
-        shape_speeds=speeds_mps.size,
-        shape_azimuths=azimuths_deg.size,
-        shape_points=measured_profile_m.size,
-    )
+        dataset=dataset,
+        source_crs=source_crs,
+        utm_crs=utm_crs,
+        x_m=x.ravel(),
+        y_m=y.ravel(),
+    ).reshape(speeds_mps.size, azimuths_deg.size, measured_profile_m.size)
+
+    valid_counts = np.sum(np.isfinite(predicted), axis=2)
+    complete = valid_counts == measured_profile_m.size
+    
+    # Calculate Pearson Correlation Coefficient
+    pred_mean = np.nanmean(predicted, axis=2, keepdims=True)
+    meas_mean = np.nanmean(measured_profile_m)
+    
+    pred_centered = predicted - pred_mean
+    meas_centered = measured_profile_m - meas_mean
+    
+    cov = np.nansum(pred_centered * meas_centered[None, None, :], axis=2)
+    pred_var = np.nansum(pred_centered * pred_centered, axis=2)
+    meas_var = np.nansum(meas_centered * meas_centered)
+    
+    errors = np.full(valid_counts.shape, np.inf, dtype=np.float64)
+    
+    # valid_mask ensures we don't divide by zero if a profile is completely flat
+    valid_mask = complete & (pred_var > 1e-6) & (meas_var > 1e-6)
+    corr = cov[valid_mask] / np.sqrt(pred_var[valid_mask] * meas_var)
+    
+    # We want to minimize error, so we map correlation [-1, 1] to error [2, 0]
+    errors[valid_mask] = 1.0 - corr
+
+    # If no valid correlation found, fallback to argmin behavior safely
+    if not np.any(valid_mask):
+        return errors, 0
 
     return errors, int(np.argmin(errors))
 

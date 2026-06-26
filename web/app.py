@@ -17,7 +17,7 @@ from pyproj import CRS, Transformer
 from rasterio.transform import rowcol
 
 from terrain_nav.dem import dataset_center_lonlat, utm_crs_for_lonlat
-from terrain_nav.search import localize_position_from_nmea
+from terrain_nav.tracking import localize_sliding_window
 from terrain_nav.simulation import generate_test_flight
 
 
@@ -57,6 +57,8 @@ def main() -> None:
         max_profile_points = st.number_input("Точек профиля для поиска", min_value=50, max_value=5000, value=600, step=50)
         flat_variance_threshold_m2 = st.number_input("Порог плоского рельефа, м²", min_value=0.0, value=1.0, step=0.5)
         smoothing_window = st.number_input("Окно сглаживания", min_value=1, max_value=51, value=5, step=2)
+        window_size_s = st.number_input("Окно трекинга, сек", min_value=5.0, value=15.0, step=5.0)
+        step_size_s = st.number_input("Шаг трекинга, сек", min_value=1.0, value=5.0, step=1.0)
         zoom_to_trajectory = st.checkbox("Приближать к траектории", value=False)
         zoom_margin_factor = st.slider(
             "Запас вокруг маршрута",
@@ -77,11 +79,13 @@ def main() -> None:
 
     if st.button("Запустить локализацию", type="primary"):
         with st.spinner("Считаю траектории и ошибки..."):
-            result = localize_position_from_nmea(
+            result = localize_sliding_window(
                 dem_path=dem_path,
                 nmea_path=nmea_path,
                 baro_altitude_m=baro_altitude_m,
                 sample_rate_hz=sample_rate_hz,
+                window_size_s=window_size_s,
+                step_size_s=step_size_s,
                 min_speed_mps=min_speed_mps,
                 max_speed_mps=max_speed_mps,
                 coarse_speed_step_mps=coarse_speed_step_mps,
