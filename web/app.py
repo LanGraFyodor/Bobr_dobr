@@ -387,6 +387,16 @@ def main() -> None:
             ["RMSE", "Weighted scoring", "Bridge mode"],
             default=["RMSE"],
         )
+        with st.expander("Коротко об алгоритмах"):
+            st.markdown(
+                """
+                **RMSE** - базовый режим: ищет траекторию с минимальной ошибкой высот между NMEA-профилем и DEM.
+
+                **Weighted scoring** - режим для слабого/однообразного рельефа: сильнее учитывает информативные перепады высот.
+
+                **Bridge mode** - режим продолжения: берет уверенный участок маршрута и продолжает прямую траекторию через слабую зону.
+                """
+            )
         if len(selected_algorithms) > 1:
             st.caption("Несколько алгоритмов запускаются последовательно и заметно увеличивают время расчета.")
         smoothing_method_label = st.selectbox("Сглаживание траектории", ["Фильтр Калмана", "Скользящее среднее"])
@@ -558,6 +568,7 @@ def _render_algorithm_result(
         )
         return
 
+    st.info(_algorithm_description(algorithm))
     _render_localization_result(
         algorithm=algorithm,
         result=result,
@@ -572,7 +583,25 @@ def _render_algorithm_result(
         show_full_heatmap=show_full_heatmap,
         zoom_to_trajectory=zoom_to_trajectory,
         zoom_margin_factor=zoom_margin_factor,
-    )
+)
+
+
+def _algorithm_description(algorithm: str) -> str:
+    descriptions = {
+        "RMSE": (
+            "RMSE: основной алгоритм. Перебирает координаты, скорость и курс, затем выбирает траекторию "
+            "с минимальной ошибкой совпадения профилей высот."
+        ),
+        "Weighted scoring": (
+            "Weighted scoring: вариант для сложного рельефа. Информативные перепады высот получают больший вес, "
+            "а плоские участки меньше влияют на итог."
+        ),
+        "Bridge mode": (
+            "Bridge mode: режим продолжения. Если часть профиля слабая, алгоритм опирается на уверенный участок "
+            "и продолжает прямую траекторию через неинформативную зону."
+        ),
+    }
+    return descriptions.get(algorithm, algorithm)
 
 
 def _render_localization_result(
@@ -628,7 +657,7 @@ def _render_localization_result(
             )
         else:
             st.subheader("Локальная heatmap корреляции")
-            st.caption("Полная heatmap 0-359° отключена для скорости. Включите галочку в боковой панели, если она нужна для защиты.")
+            st.caption("Полная heatmap 0-359° отключена. Включите, если нужна.")
             _show_figure(
                 _plot_correlation_heatmap(
                     result.correlations,
@@ -767,7 +796,7 @@ def _render_bridge_result(
             )
         else:
             st.subheader("Локальная heatmap корреляции")
-            st.caption("Полная heatmap 0-359° отключена для скорости.")
+            st.caption("Полная heatmap 0-359° отключена. Включите, если нужна.")
             _show_figure(
                 _plot_correlation_heatmap(
                     bridge_result.line.correlations,
