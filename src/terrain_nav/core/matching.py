@@ -4,7 +4,7 @@ import numpy as np
 import rasterio
 from pyproj import CRS
 
-from terrain_nav.sampling import sample_dem_heights
+from terrain_nav.core.sampling import sample_dem_heights
 
 
 def compute_error_grid(
@@ -18,6 +18,7 @@ def compute_error_grid(
     start_y_m: float,
     speeds_mps: np.ndarray,
     azimuths_deg: np.ndarray,
+    use_weighted_scoring: bool = True,
 ) -> tuple[np.ndarray, int]:
     time_offsets = timestamps_s - timestamps_s[0]
 
@@ -37,15 +38,32 @@ def compute_error_grid(
         y_m=y.ravel(),
     ).reshape(speeds_mps.size, azimuths_deg.size, measured_profile_m.size)
 
+    weights = make_profile_weights(measured_profile_m) if use_weighted_scoring else np.ones_like(measured_profile_m)
     diff = predicted - measured_profile_m[None, None, :]
     valid = np.isfinite(diff)
     valid_counts = np.sum(valid, axis=2)
-    squared_error_sum = np.nansum(diff * diff, axis=2)
+    squared_error_sum = np.nansum(diff * diff * weights[None, None, :], axis=2)
     errors = np.full(valid_counts.shape, np.inf, dtype=np.float64)
     complete = valid_counts == measured_profile_m.size
-    errors[complete] = np.sqrt(squared_error_sum[complete] / measured_profile_m.size)
+    errors[complete] = np.sqrt(squared_error_sum[complete] / np.sum(weights))
 
     return errors, int(np.argmin(errors))
+
+
+def make_profile_weights(profile_m: np.ndarray) -> np.ndarray:
+    if profile_m.size < 3:
+        return np.ones(profile_m.shape, dtype=np.float64)
+
+    fill = float(np.nanmedian(profile_m)) if np.isfinite(profile_m).any() else 0.0
+    clean = np.nan_to_num(profile_m.astype(np.float64, copy=False), nan=fill)
+    gradient = np.abs(np.gradient(clean))
+    curvature = np.abs(np.gradient(np.gradient(clean)))
+    features = gradient + 0.5 * curvature
+    feature_mean = float(np.mean(features))
+    if not np.isfinite(feature_mean) or feature_mean <= 1e-9:
+        return np.ones(profile_m.shape, dtype=np.float64)
+
+    return 1.0 + np.clip(features / feature_mean, 0.0, 4.0)
 
 
 def search_start_points(
@@ -59,6 +77,7 @@ def search_start_points(
     speeds_mps: np.ndarray,
     azimuths_deg: np.ndarray,
     top_k: int = 1,
+    use_weighted_scoring: bool = True,
 ) -> dict[str, float | int | np.ndarray | list[dict[str, float | int | np.ndarray]]]:
     best: dict[str, float | int | np.ndarray] | None = None
     candidates: list[dict[str, float | int | np.ndarray]] = []
@@ -75,6 +94,7 @@ def search_start_points(
             float(start_y_m),
             speeds_mps,
             azimuths_deg,
+            use_weighted_scoring=use_weighted_scoring,
         )
         candidate_error = float(errors.ravel()[flat_index])
         if not np.isfinite(candidate_error):
@@ -118,6 +138,7 @@ def refine_best_candidates(
     fine_azimuth_step_deg: float,
     refine_radius_m: float,
     refine_start_step_m: float,
+    use_weighted_scoring: bool = True,
 ) -> tuple[dict[str, float | int | np.ndarray], np.ndarray, np.ndarray]:
     best: dict[str, float | int | np.ndarray] | None = None
     best_speeds = np.array([], dtype=np.float64)
@@ -154,6 +175,7 @@ def refine_best_candidates(
             start_points=starts,
             speeds_mps=speeds,
             azimuths_deg=azimuths,
+            use_weighted_scoring=use_weighted_scoring,
         )
         if best is None or float(refined["error"]) < float(best["error"]):
             best = refined

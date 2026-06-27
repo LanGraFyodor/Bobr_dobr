@@ -1,0 +1,262 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import rasterio
+from pyproj import CRS
+
+from terrain_nav.io.dem import dataset_center_lonlat, dataset_center_utm, dataset_utm_bounds, utm_crs_for_lonlat
+from terrain_nav.core.geometry import compute_trajectory_points
+from terrain_nav.models import GeneratedFlight
+from terrain_nav.core.sampling import sample_dem_heights
+
+
+def generate_test_flight(
+    dem_path: str | Path,
+    output_path: str | Path,
+    start_x_m: float | None = None,
+    start_y_m: float | None = None,
+    speed_mps: float = 20.0,
+    azimuth_deg: float = 45.0,
+    duration_s: float = 600.0,
+    sample_rate_hz: float = 1.0,
+    baro_altitude_m: float = 1500.0,
+    noise_std_m: float = 2.0,
+    seed: int = 42,
+    route_seed: int | None = None,
+) -> GeneratedFlight:
+    if duration_s <= 0:
+        raise ValueError("duration_s must be positive")
+    if sample_rate_hz <= 0:
+        raise ValueError("sample_rate_hz must be positive")
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with rasterio.open(dem_path) as dataset:
+        dem = dataset.read(1).astype(np.float64)
+        if dataset.nodata is not None:
+            dem[dem == dataset.nodata] = np.nan
+
+        source_crs = CRS.from_user_input(dataset.crs)
+        center_lon, center_lat = dataset_center_lonlat(dataset, source_crs)
+        utm_crs = utm_crs_for_lonlat(center_lon, center_lat)
+
+        timestamps_s = np.arange(0.0, duration_s, 1.0 / sample_rate_hz)
+        if start_x_m is None or start_y_m is None:
+            start_x_m, start_y_m = _auto_start_for_trajectory(
+                dem=dem,
+                dataset=dataset,
+                source_crs=source_crs,
+                utm_crs=utm_crs,
+                speed_mps=speed_mps,
+                azimuth_deg=azimuth_deg,
+                timestamps_s=timestamps_s,
+                baro_altitude_m=baro_altitude_m,
+                route_seed=route_seed,
+            )
+
+        trajectory_x_m, trajectory_y_m = compute_trajectory_points(
+            start_x_m=float(start_x_m),
+            start_y_m=float(start_y_m),
+            speed_mps=speed_mps,
+            azimuth_deg=azimuth_deg,
+            timestamps_s=timestamps_s,
+        )
+        terrain_heights_m = sample_dem_heights(dem, dataset, source_crs, utm_crs, trajectory_x_m, trajectory_y_m)
+
+    if np.isnan(terrain_heights_m).any():
+        raise ValueError("Generated trajectory leaves DEM bounds or crosses nodata cells")
+
+    rng = np.random.default_rng(seed)
+    radio_altitudes_m = baro_altitude_m - terrain_heights_m
+    if np.any(radio_altitudes_m <= 0.0):
+        max_terrain = float(np.nanmax(terrain_heights_m))
+        raise ValueError(
+            "Generated trajectory is physically impossible: terrain is above barometric altitude. "
+            f"Max terrain is {max_terrain:.1f} m, barometric altitude is {baro_altitude_m:.1f} m. "
+            "Reduce duration/speed, change azimuth, or choose another start point."
+        )
+    noisy_radio_altitudes_m = radio_altitudes_m + rng.normal(0.0, noise_std_m, radio_altitudes_m.shape)
+    if np.any(noisy_radio_altitudes_m <= 0.0):
+        raise ValueError(
+            "Generated noisy radio-altimeter profile contains non-positive altitude. "
+            "Reduce noise or choose a route with larger terrain clearance."
+        )
+    nmea_lines = [make_gga_sentence(t, altitude) for t, altitude in zip(timestamps_s, noisy_radio_altitudes_m)]
+    output_path.write_text("\n".join(nmea_lines) + "\n", encoding="utf-8")
+
+    return GeneratedFlight(
+        timestamps_s=timestamps_s,
+        trajectory_x_m=trajectory_x_m,
+        trajectory_y_m=trajectory_y_m,
+        terrain_heights_m=terrain_heights_m,
+        radio_altitudes_m=radio_altitudes_m,
+        noisy_radio_altitudes_m=noisy_radio_altitudes_m,
+        nmea_lines=nmea_lines,
+    )
+
+
+def make_gga_sentence(timestamp_s: float, altitude_m: float) -> str:
+    payload = f"GPGGA,{format_nmea_time(timestamp_s)},,,,,,,,{altitude_m:.3f},M,0.0,M,,"
+    checksum = 0
+    for char in payload:
+        checksum ^= ord(char)
+    return f"${payload}*{checksum:02X}"
+
+
+def format_nmea_time(timestamp_s: float) -> str:
+    timestamp_s %= 24.0 * 3600.0
+    hours = int(timestamp_s // 3600.0)
+    minutes = int((timestamp_s % 3600.0) // 60.0)
+    seconds = timestamp_s - hours * 3600.0 - minutes * 60.0
+    return f"{hours:02d}{minutes:02d}{seconds:06.3f}"
+
+
+def _auto_start_for_trajectory(
+    dem: np.ndarray,
+    dataset: rasterio.io.DatasetReader,
+    source_crs: CRS,
+    utm_crs: CRS,
+    speed_mps: float,
+    azimuth_deg: float,
+    timestamps_s: np.ndarray,
+    baro_altitude_m: float,
+    min_clearance_m: float = 50.0,
+    route_seed: int | None = None,
+) -> tuple[float, float]:
+    if timestamps_s.size == 0:
+        return dataset_center_utm(dataset, source_crs, utm_crs)
+
+    bounds = dataset_utm_bounds(dataset, source_crs, utm_crs)
+    min_x, max_x, min_y, max_y = bounds
+
+    total_time_s = float(timestamps_s[-1] - timestamps_s[0])
+    distance_m = float(speed_mps) * total_time_s
+    azimuth_rad = np.deg2rad(azimuth_deg)
+    end_dx_m = distance_m * np.sin(azimuth_rad)
+    end_dy_m = distance_m * np.cos(azimuth_rad)
+
+    margin_m = min(2_000.0, max((max_x - min_x), (max_y - min_y)) * 0.03)
+    start_min_x = min_x + margin_m - min(0.0, end_dx_m)
+    start_max_x = max_x - margin_m - max(0.0, end_dx_m)
+    start_min_y = min_y + margin_m - min(0.0, end_dy_m)
+    start_max_y = max_y - margin_m - max(0.0, end_dy_m)
+
+    if start_min_x > start_max_x or start_min_y > start_max_y:
+        max_route_m = min(max_x - min_x, max_y - min_y) - 2.0 * margin_m
+        raise ValueError(
+            "Generated trajectory is longer than the DEM allows. "
+            f"Reduce speed/duration: route is {distance_m:.0f} m, safe map span is about {max_route_m:.0f} m."
+        )
+
+    center_start = dataset_center_utm(dataset, source_crs, utm_crs)
+    if route_seed is None and (
+        start_min_x <= center_start[0] <= start_max_x
+        and start_min_y <= center_start[1] <= start_max_y
+        and _is_physically_valid_route(
+            dem,
+            dataset,
+            source_crs,
+            utm_crs,
+            center_start[0],
+            center_start[1],
+            speed_mps,
+            azimuth_deg,
+            timestamps_s,
+            baro_altitude_m,
+            min_clearance_m,
+        )
+    ):
+        return center_start
+
+    grid_size = 21 if route_seed is not None else 13
+    xs = np.linspace(start_min_x, start_max_x, grid_size, dtype=np.float64)
+    ys = np.linspace(start_min_y, start_max_y, grid_size, dtype=np.float64)
+    center_x = (start_min_x + start_max_x) * 0.5
+    center_y = (start_min_y + start_max_y) * 0.5
+    candidates: list[tuple[float, float, float]] = []
+
+    for x_m in xs:
+        for y_m in ys:
+            trajectory_x_m, trajectory_y_m = compute_trajectory_points(
+                start_x_m=float(x_m),
+                start_y_m=float(y_m),
+                speed_mps=speed_mps,
+                azimuth_deg=azimuth_deg,
+                timestamps_s=timestamps_s,
+            )
+            terrain_heights_m = sample_dem_heights(
+                dem,
+                dataset,
+                source_crs,
+                utm_crs,
+                trajectory_x_m,
+                trajectory_y_m,
+            )
+            if np.isnan(terrain_heights_m).any():
+                continue
+            max_terrain_m = float(np.nanmax(terrain_heights_m))
+            if max_terrain_m >= baro_altitude_m - min_clearance_m:
+                continue
+
+            profile_variance = float(np.nanvar(terrain_heights_m))
+            center_penalty = 1e-7 * ((float(x_m) - center_x) ** 2 + (float(y_m) - center_y) ** 2)
+            score = profile_variance - center_penalty
+            candidates.append((score, float(x_m), float(y_m)))
+
+    if not candidates:
+        raise ValueError(
+            "Cannot generate a physically valid test route for the selected parameters: "
+            f"terrain must stay below {baro_altitude_m - min_clearance_m:.1f} m. "
+            "Reduce duration/speed, change azimuth, or increase barometric altitude only if the scenario allows it."
+        )
+
+    candidates.sort(reverse=True)
+    if route_seed is None:
+        _, best_x, best_y = candidates[0]
+        return best_x, best_y
+
+    pool_size = min(len(candidates), max(10, len(candidates) // 8))
+    rng = np.random.default_rng(route_seed)
+    selected_index = int(rng.integers(0, pool_size))
+    _, selected_x, selected_y = candidates[selected_index]
+    return selected_x, selected_y
+
+
+def _is_physically_valid_route(
+    dem: np.ndarray,
+    dataset: rasterio.io.DatasetReader,
+    source_crs: CRS,
+    utm_crs: CRS,
+    start_x_m: float,
+    start_y_m: float,
+    speed_mps: float,
+    azimuth_deg: float,
+    timestamps_s: np.ndarray,
+    baro_altitude_m: float,
+    min_clearance_m: float,
+) -> bool:
+    trajectory_x_m, trajectory_y_m = compute_trajectory_points(
+        start_x_m=float(start_x_m),
+        start_y_m=float(start_y_m),
+        speed_mps=speed_mps,
+        azimuth_deg=azimuth_deg,
+        timestamps_s=timestamps_s,
+    )
+    terrain_heights_m = sample_dem_heights(
+        dem,
+        dataset,
+        source_crs,
+        utm_crs,
+        trajectory_x_m,
+        trajectory_y_m,
+    )
+    return bool(
+        not np.isnan(terrain_heights_m).any()
+        and float(np.nanmax(terrain_heights_m)) < baro_altitude_m - min_clearance_m
+    )
+
+
+_format_nmea_time = format_nmea_time

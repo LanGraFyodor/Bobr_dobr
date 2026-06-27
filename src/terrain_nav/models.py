@@ -33,14 +33,18 @@ class SearchGrid:
 class LocalizationResult:
     speed_mps: float
     azimuth_deg: float
+    velocity_x_mps: float
+    velocity_y_mps: float
     start_x_m: float
     start_y_m: float
     current_x_m: float
     current_y_m: float
     best_error: float
+    best_correlation: float
     best_speed_index: int
     best_azimuth_index: int
     errors: np.ndarray
+    correlations: np.ndarray
     speeds_mps: np.ndarray
     azimuths_deg: np.ndarray
     trajectory_x_m: np.ndarray
@@ -51,6 +55,9 @@ class LocalizationResult:
     smoothed_trajectory_y_m: np.ndarray
     terrain_variance_m2: float
     confidence: float
+    estimated_accuracy_m: float
+    quality_label: str
+    scoring_mode: str
     is_flat_terrain: bool
 
 

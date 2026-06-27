@@ -8,3 +8,4 @@ __pycache__/
 outputs/
 .streamlit/
 .agents/
+rust/terrain_nav_core/target/

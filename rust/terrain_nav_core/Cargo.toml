@@ -1,0 +1,13 @@
+[package]
+name = "terrain_nav_core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "terrain_nav_core"
+crate-type = ["cdylib"]
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3

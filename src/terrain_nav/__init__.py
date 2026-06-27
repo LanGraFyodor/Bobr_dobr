@@ -1,6 +1,6 @@
-from terrain_nav.dem import DemData, read_dem_as_utm
-from terrain_nav.nmea import NmeaProfile, parse_nmea_profile
-from terrain_nav.search import (
+from terrain_nav.io.dem import DemData, read_dem_as_utm
+from terrain_nav.io.nmea import NmeaProfile, parse_nmea_profile
+from terrain_nav.core.search import (
     LocalizationResult,
     SearchGrid,
     localize_from_nmea,

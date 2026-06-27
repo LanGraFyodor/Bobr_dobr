@@ -17,12 +17,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dem", default=str(ROOT_DIR / "data" / "map.tif"))
     parser.add_argument("--out", default=str(ROOT_DIR / "outputs" / "test_flight.nmea"))
     parser.add_argument("--speed", type=float, default=20.0)
-    parser.add_argument("--azimuth", type=float, default=45.0)
-    parser.add_argument("--duration", type=float, default=2400.0)
+    parser.add_argument("--azimuth", type=float, default=225.0)
+    parser.add_argument("--duration", type=float, default=600.0)
     parser.add_argument("--rate", type=float, default=1.0)
     parser.add_argument("--baro-altitude", type=float, default=1500.0)
     parser.add_argument("--noise-std", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--route-seed", type=int, default=7)
     parser.add_argument("--start-x", type=float, default=None)
     parser.add_argument("--start-y", type=float, default=None)
     return parser
@@ -42,6 +43,7 @@ def main() -> None:
         baro_altitude_m=args.baro_altitude,
         noise_std_m=args.noise_std,
         seed=args.seed,
+        route_seed=args.route_seed,
     )
 
     print(f"saved: {args.out}")

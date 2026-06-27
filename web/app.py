@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import sys
 import tempfile
 from pathlib import Path
@@ -16,8 +17,8 @@ import streamlit as st
 from pyproj import CRS, Transformer
 from rasterio.transform import rowcol
 
-from terrain_nav.dem import dataset_center_lonlat, utm_crs_for_lonlat
-from terrain_nav.search import localize_position_from_nmea
+from terrain_nav.io.dem import dataset_center_lonlat, utm_crs_for_lonlat
+from terrain_nav.core.search import localize_position_from_nmea
 from terrain_nav.simulation import generate_test_flight
 
 
@@ -50,16 +51,21 @@ def main() -> None:
         fine_speed_step_mps = st.number_input("Точный шаг скорости, м/с", min_value=0.5, value=1.0, step=0.5)
         coarse_azimuth_step_deg = st.number_input("Грубый шаг азимута, град", min_value=1.0, max_value=45.0, value=5.0, step=1.0)
         fine_azimuth_step_deg = st.number_input("Точный шаг азимута, град", min_value=1.0, max_value=10.0, value=1.0, step=1.0)
-        coarse_start_step_m = st.number_input("Грубый шаг X/Y, м", min_value=1000.0, value=10000.0, step=1000.0)
-        refine_radius_m = st.number_input("Радиус уточнения X/Y, м", min_value=0.0, value=5000.0, step=500.0)
+        coarse_start_step_m = st.number_input("Грубый шаг X/Y, м", min_value=1000.0, value=5000.0, step=1000.0)
+        refine_radius_m = st.number_input("Радиус уточнения X/Y, м", min_value=0.0, value=10000.0, step=500.0)
         refine_start_step_m = st.number_input("Точный шаг X/Y, м", min_value=100.0, value=1000.0, step=100.0)
-        coarse_top_k = st.number_input("Кандидатов для уточнения", min_value=1, max_value=50, value=10, step=1)
+        coarse_top_k = st.number_input("Кандидатов для уточнения", min_value=1, max_value=100, value=50, step=1)
+        coarse_profile_points = st.number_input("Точек для грубого поиска", min_value=50, max_value=1000, value=250, step=10)
         max_profile_points = st.number_input("Точек профиля для поиска", min_value=50, max_value=5000, value=600, step=50)
+        search_radius_m = st.number_input("Радиус поиска от центра, м (0 = вся карта)", min_value=0.0, value=0.0, step=5000.0)
         flat_variance_threshold_m2 = st.number_input("Порог плоского рельефа, м²", min_value=0.0, value=1.0, step=0.5)
+        use_weighted_scoring = st.checkbox("Weighted scoring для плоских участков", value=False)
+        smoothing_method_label = st.selectbox("Сглаживание траектории", ["Фильтр Калмана", "Скользящее среднее"])
+        smoothing_method = "kalman" if smoothing_method_label == "Фильтр Калмана" else "moving_average"
         smoothing_window = st.number_input("Окно сглаживания", min_value=1, max_value=51, value=5, step=2)
         zoom_to_trajectory = st.checkbox("Приближать к траектории", value=False)
         zoom_margin_factor = st.slider(
-            "Запас вокруг маршрута",
+            "Запас вокруг маршрута при приближении",
             min_value=0.2,
             max_value=3.0,
             value=1.0,
@@ -94,26 +100,38 @@ def main() -> None:
                 coarse_top_k=int(coarse_top_k),
                 flat_variance_threshold_m2=flat_variance_threshold_m2,
                 smoothing_window=int(smoothing_window),
+                smoothing_method=smoothing_method,
+                use_weighted_scoring=bool(use_weighted_scoring),
+                coarse_profile_points=int(coarse_profile_points),
                 max_profile_points=int(max_profile_points),
+                search_radius_m=None if search_radius_m <= 0 else float(search_radius_m),
+                auto_retry_unweighted=False,
             )
 
         if result.is_flat_terrain:
             st.warning("Профиль рельефа почти плоский: поиск по карте отключен, использованы старые координаты.")
+        elif not use_weighted_scoring and _has_dominant_flat_sections(result.measured_profile_m):
+            st.info("В профиле много плоских участков. Если результат выглядит неуверенно, попробуйте включить `Weighted scoring для плоских участков`.")
 
-        col_speed, col_course, col_error, col_confidence = st.columns(4)
+        col_speed, col_course, col_error, col_corr, col_confidence, col_accuracy = st.columns(6)
         col_speed.metric("Скорость", f"{result.speed_mps:.1f} м/с")
         col_course.metric("Курс", f"{result.azimuth_deg:.0f}°")
-        col_error.metric("RMSE", f"{result.best_error:.2f} м")
+        error_label = "Weighted RMSE" if result.scoring_mode == "weighted" else "RMSE"
+        col_error.metric(error_label, f"{result.best_error:.2f} м")
+        col_corr.metric("Correlation", f"{result.best_correlation:.3f}")
         col_confidence.metric("Confidence", f"{result.confidence * 100:.0f}%")
+        accuracy_text = "неопределена" if not np.isfinite(result.estimated_accuracy_m) else f"±{result.estimated_accuracy_m:.0f} м"
+        col_accuracy.metric("Оценка точности", accuracy_text)
 
-        col_start, col_current = st.columns(2)
+        col_start, col_current, col_velocity = st.columns(3)
         col_start.metric("Старт X/Y, м", f"{result.start_x_m:.0f}, {result.start_y_m:.0f}")
         col_current.metric("Текущие X/Y, м", f"{result.current_x_m:.0f}, {result.current_y_m:.0f}")
+        col_velocity.metric("Вектор Vx/Vy", f"{result.velocity_x_mps:.2f}, {result.velocity_y_mps:.2f} м/с")
 
         plot_col, map_col = st.columns(2)
         with plot_col:
-            st.subheader("Heatmap ошибок")
-            st.pyplot(_plot_error_heatmap(result.errors, result.speeds_mps, result.azimuths_deg))
+            st.subheader("Heatmap корреляции")
+            _show_figure(_plot_correlation_heatmap(result.correlations, result.speeds_mps, result.azimuths_deg))
 
         with map_col:
             st.subheader("Траектория на DEM")
@@ -138,12 +156,19 @@ def main() -> None:
                 {
                     "speed_mps": float(result.speed_mps),
                     "azimuth_deg": float(result.azimuth_deg),
+                    "velocity_x_mps": float(result.velocity_x_mps),
+                    "velocity_y_mps": float(result.velocity_y_mps),
                     "start_x_m": float(result.start_x_m),
                     "start_y_m": float(result.start_y_m),
                     "current_x_m": float(result.current_x_m),
                     "current_y_m": float(result.current_y_m),
                     "best_error": float(result.best_error),
+                    "requested_weighted_scoring": bool(use_weighted_scoring),
+                    "scoring_mode": result.scoring_mode,
+                    "best_correlation": float(result.best_correlation),
                     "confidence": float(result.confidence),
+                    "estimated_accuracy_m": float(result.estimated_accuracy_m),
+                    "quality_label": result.quality_label,
                     "terrain_variance_m2": float(result.terrain_variance_m2),
                     "is_flat_terrain": bool(result.is_flat_terrain),
                     "speed_index": int(result.best_speed_index),
@@ -174,26 +199,34 @@ def _select_nmea_path(dem_path: str | None) -> str | None:
     st.subheader("Тестовый полет")
 
     speed = st.number_input("Тестовая скорость, м/с", min_value=1.0, value=20.0, step=1.0)
-    azimuth = st.number_input("Тестовый курс, град", min_value=0.0, max_value=359.0, value=45.0, step=1.0)
-    duration = st.number_input("Длительность, с", min_value=5.0, value=2400.0, step=60.0)
+    azimuth = st.number_input("Тестовый курс, град", min_value=0.0, max_value=359.0, value=225.0, step=1.0)
+    duration = st.number_input("Длительность, с", min_value=5.0, value=600.0, step=60.0)
     rate = st.number_input("Частота теста, Гц", min_value=0.1, max_value=10.0, value=1.0, step=0.5)
     noise = st.number_input("Шум, м", min_value=0.0, value=2.0, step=0.5)
+    route_seed = st.number_input("Seed маршрута", min_value=0, value=7, step=1)
+    seed = st.number_input("Seed шума", min_value=0, value=42, step=1)
 
     if st.button("Сгенерировать NMEA"):
         if dem_path is None:
             st.error("Сначала выберите DEM-карту.")
         else:
-            generated = generate_test_flight(
-                dem_path=dem_path,
-                output_path=DEFAULT_NMEA_PATH,
-                speed_mps=speed,
-                azimuth_deg=azimuth,
-                duration_s=duration,
-                sample_rate_hz=rate,
-                noise_std_m=noise,
-            )
-            st.session_state["generated_nmea_path"] = str(DEFAULT_NMEA_PATH)
-            st.success(f"Создано {generated.timestamps_s.size} NMEA-сообщений.")
+            try:
+                generated = generate_test_flight(
+                    dem_path=dem_path,
+                    output_path=DEFAULT_NMEA_PATH,
+                    speed_mps=speed,
+                    azimuth_deg=azimuth,
+                    duration_s=duration,
+                    sample_rate_hz=rate,
+                    noise_std_m=noise,
+                    seed=int(seed),
+                    route_seed=int(route_seed),
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                st.session_state["generated_nmea_path"] = str(DEFAULT_NMEA_PATH)
+                st.success(f"Создано {generated.timestamps_s.size} NMEA-сообщений.")
 
     generated_path = st.session_state.get("generated_nmea_path")
     if generated_path:
@@ -212,25 +245,54 @@ def _save_uploaded_file(uploaded_file, suffix: str) -> str:
         return tmp.name
 
 
-def _plot_error_heatmap(errors: np.ndarray, speeds: np.ndarray, azimuths: np.ndarray):
+def _has_dominant_flat_sections(profile_m: np.ndarray) -> bool:
+    if profile_m.size < 20:
+        return False
+
+    fill = float(np.nanmedian(profile_m)) if np.isfinite(profile_m).any() else 0.0
+    clean = np.nan_to_num(profile_m.astype(np.float64, copy=False), nan=fill)
+    gradient = np.abs(np.gradient(clean))
+    curvature = np.abs(np.gradient(np.gradient(clean)))
+    features = gradient + 0.5 * curvature
+
+    high = float(np.percentile(features, 90.0))
+    if high <= 1e-9:
+        return True
+
+    flat_threshold = max(1.0, high * 0.15)
+    flat_fraction = float(np.mean(features <= flat_threshold))
+    return flat_fraction >= 0.7
+
+
+def _show_figure(fig) -> None:
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    buffer.seek(0)
+    st.image(buffer, use_container_width=True)
+
+
+def _plot_correlation_heatmap(correlations: np.ndarray, speeds: np.ndarray, azimuths: np.ndarray):
     fig, ax = plt.subplots(figsize=(8, 5))
-    if not np.isfinite(errors).any():
+    if not np.isfinite(correlations).any():
         ax.text(0.5, 0.5, "Поиск отключен: плоский рельеф", ha="center", va="center")
         ax.set_axis_off()
         fig.tight_layout()
         return fig
 
     image = ax.imshow(
-        errors,
+        correlations,
         aspect="auto",
         origin="lower",
         extent=[azimuths.min(), azimuths.max(), speeds.min(), speeds.max()],
-        cmap="magma_r",
+        cmap="viridis",
+        vmin=-1.0,
+        vmax=1.0,
     )
     ax.set_xlabel("Азимут, град")
     ax.set_ylabel("Скорость, м/с")
-    ax.set_title("RMSE по сетке скорость-азимут")
-    fig.colorbar(image, ax=ax, label="RMSE, м")
+    ax.set_title("Корреляция по сетке скорость-азимут")
+    fig.colorbar(image, ax=ax, label="Correlation")
     fig.tight_layout()
     return fig
 
