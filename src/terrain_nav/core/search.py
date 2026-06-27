@@ -144,6 +144,7 @@ def localize_position_from_nmea(
     use_rust_core: bool = True,
     allow_python_fallback: bool = True,
     auto_retry_unweighted: bool = True,
+    auto_dense_retry: bool = True,
 ) -> LocalizationResult:
     profile = parse_nmea_profile(nmea_path, baro_altitude_m, sample_rate_hz)
     profile = _limit_profile_points(profile, max_profile_points)
@@ -173,6 +174,41 @@ def localize_position_from_nmea(
                 coarse_profile=coarse_profile,
                 search_radius_m=search_radius_m,
             )
+            if auto_dense_retry and _needs_dense_retry(result, coarse_start_step_m, coarse_top_k):
+                dense_result = localize_position_from_nmea(
+                    dem_path=dem_path,
+                    nmea_path=nmea_path,
+                    previous_x_m=previous_x_m,
+                    previous_y_m=previous_y_m,
+                    baro_altitude_m=baro_altitude_m,
+                    sample_rate_hz=sample_rate_hz,
+                    min_speed_mps=min_speed_mps,
+                    max_speed_mps=max_speed_mps,
+                    coarse_speed_step_mps=coarse_speed_step_mps,
+                    fine_speed_step_mps=fine_speed_step_mps,
+                    coarse_azimuth_step_deg=coarse_azimuth_step_deg,
+                    fine_azimuth_step_deg=fine_azimuth_step_deg,
+                    coarse_start_step_m=1_000.0,
+                    refine_radius_m=max(refine_radius_m, 10_000.0),
+                    refine_start_step_m=min(refine_start_step_m, 500.0),
+                    coarse_top_k=max(int(coarse_top_k), 200),
+                    flat_variance_threshold_m2=flat_variance_threshold_m2,
+                    smoothing_window=smoothing_window,
+                    smoothing_method=smoothing_method,
+                    use_weighted_scoring=use_weighted_scoring,
+                    coarse_profile_points=coarse_profile_points,
+                    max_profile_points=max_profile_points,
+                    search_radius_m=search_radius_m,
+                    use_rust_core=use_rust_core,
+                    allow_python_fallback=allow_python_fallback,
+                    auto_retry_unweighted=False,
+                    auto_dense_retry=False,
+                )
+                if _is_better_result(dense_result, result):
+                    result = _replace_scoring_mode(
+                        dense_result,
+                        f"{dense_result.scoring_mode}_dense_retry",
+                    )
             if use_weighted_scoring and auto_retry_unweighted:
                 regular_result = localize_position_from_nmea(
                     dem_path=dem_path,
@@ -201,6 +237,7 @@ def localize_position_from_nmea(
                     use_rust_core=use_rust_core,
                     allow_python_fallback=allow_python_fallback,
                     auto_retry_unweighted=False,
+                    auto_dense_retry=auto_dense_retry,
                 )
                 if _is_better_result(regular_result, result):
                     return _replace_scoring_mode(regular_result, "auto_fallback_regular")
@@ -620,6 +657,18 @@ def _needs_unweighted_retry(result: LocalizationResult) -> bool:
     if result.is_flat_terrain:
         return False
     if result.confidence < 0.35:
+        return True
+    if np.isfinite(result.estimated_accuracy_m) and result.estimated_accuracy_m > 150.0:
+        return True
+    return False
+
+
+def _needs_dense_retry(result: LocalizationResult, coarse_start_step_m: float, coarse_top_k: int) -> bool:
+    if result.is_flat_terrain:
+        return False
+    if coarse_start_step_m <= 1_000.0 and coarse_top_k >= 200:
+        return False
+    if result.confidence < 0.20:
         return True
     if np.isfinite(result.estimated_accuracy_m) and result.estimated_accuracy_m > 150.0:
         return True
