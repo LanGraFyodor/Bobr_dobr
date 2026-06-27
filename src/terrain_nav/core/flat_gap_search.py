@@ -115,9 +115,16 @@ def localize_with_flat_gap_bridge(
     before_stop = gap.start_index
     after_start = gap.end_index + 1
     if before_stop < min_segment_points:
-        raise ValueError("Перед плоским разрывом слишком мало данных для надежной привязки.")
-    if profile.timestamps_s.size - after_start < min_segment_points:
-        raise ValueError("После плоского разрыва слишком мало данных для повторной привязки.")
+        return _localize_straight_hypothesis(
+            dem_path=dem_path,
+            nmea_path=nmea_path,
+            profile=profile,
+            baro_altitude_m=baro_altitude_m,
+            sample_rate_hz=sample_rate_hz,
+            localize_kwargs=localize_kwargs,
+        )
+    after_point_count = max(0, int(profile.timestamps_s.size - after_start))
+    has_after_validation = after_point_count >= min_segment_points
 
     with TemporaryDirectory() as tmp_dir:
         tmp = Path(tmp_dir)
@@ -148,21 +155,27 @@ def localize_with_flat_gap_bridge(
     entry_y = float(full_y[gap.start_index])
 
     full_predicted_profile = _sample_trajectory(dem_path, full_x, full_y)
-    after_rmse, after_correlation = _profile_match_metrics(
-        profile.terrain_profile_m[after_start:],
-        full_predicted_profile[after_start:],
-    )
-    after_confidence = _validation_confidence(after_rmse, after_correlation)
-
-    cross_track_error, along_track_error = _anchor_errors_against_line(
-        line_start_x_m=before.start_x_m,
-        line_start_y_m=before.start_y_m,
-        azimuth_deg=before.azimuth_deg,
-        anchor_x_m=float(full_x[after_start]),
-        anchor_y_m=float(full_y[after_start]),
-        expected_x_m=float(full_x[after_start]),
-        expected_y_m=float(full_y[after_start]),
-    )
+    if has_after_validation:
+        after_rmse, after_correlation = _profile_match_metrics(
+            profile.terrain_profile_m[after_start:],
+            full_predicted_profile[after_start:],
+        )
+        after_confidence = _validation_confidence(after_rmse, after_correlation)
+        cross_track_error, along_track_error = _anchor_errors_against_line(
+            line_start_x_m=before.start_x_m,
+            line_start_y_m=before.start_y_m,
+            azimuth_deg=before.azimuth_deg,
+            anchor_x_m=float(full_x[after_start]),
+            anchor_y_m=float(full_y[after_start]),
+            expected_x_m=float(full_x[after_start]),
+            expected_y_m=float(full_y[after_start]),
+        )
+    else:
+        after_rmse = float("nan")
+        after_correlation = float("nan")
+        after_confidence = before.confidence
+        cross_track_error = 0.0
+        along_track_error = 0.0
     bridge = bridge_flat_gap(
         timestamps_s=profile.timestamps_s,
         gap=gap,
@@ -175,10 +188,13 @@ def localize_with_flat_gap_bridge(
     )
 
     confidence = float(min(before.confidence, after_confidence, float(bridge.confidence[-1])))
+    if not has_after_validation:
+        confidence *= 0.75
     anchor_disagreement = float(abs(cross_track_error) + 0.25 * abs(along_track_error))
+    after_penalty = 0.0 if not has_after_validation else max(after_rmse if np.isfinite(after_rmse) else 1_000.0, 0.0) * 0.50
     estimated_accuracy = float(
         before.estimated_accuracy_m
-        + max(after_rmse if np.isfinite(after_rmse) else 1_000.0, 0.0) * 0.50
+        + after_penalty
         + anchor_disagreement * 0.25
         + max(0.0, 1.0 - confidence) * 100.0
     )
@@ -189,6 +205,7 @@ def localize_with_flat_gap_bridge(
         after_correlation=after_correlation,
         bridge_confidence=confidence,
         estimated_accuracy_m=estimated_accuracy,
+        has_after_validation=has_after_validation,
     )
 
     return FlatGapBridgeResult(
@@ -202,7 +219,7 @@ def localize_with_flat_gap_bridge(
         before_end_index=before_stop - 1,
         after_start_index=after_start,
         before_point_count=int(before_stop),
-        after_point_count=int(profile.timestamps_s.size - after_start),
+        after_point_count=after_point_count,
         after_anchor_cross_track_error_m=cross_track_error,
         after_anchor_along_track_error_m=along_track_error,
         after_validation_rmse_m=after_rmse,
@@ -421,9 +438,12 @@ def _bridge_reliability(
     after_correlation: float,
     bridge_confidence: float,
     estimated_accuracy_m: float,
+    has_after_validation: bool = True,
 ) -> tuple[bool, str | None]:
     if before_confidence < 0.35:
         return False, "информативный участок до плоскости не дал уверенной геопривязки"
+    if not has_after_validation:
+        return False, "после слабого участка мало данных для независимой проверки продолжения"
     if not np.isfinite(after_rmse_m) or after_rmse_m > 80.0:
         return False, "участок после плоскости не подтверждает продолжение прямой"
     if after_correlation < 0.35:

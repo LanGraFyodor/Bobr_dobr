@@ -5,3 +5,4 @@ scipy>=1.11
 streamlit>=1.36
 matplotlib>=3.8
 affine>=2.4
+streamlit-image-coordinates>=0.1.9
